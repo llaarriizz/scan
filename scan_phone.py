@@ -14,14 +14,17 @@ MAC under Settings > About > Status on the phone, then use --mac.
 """
 
 import argparse
+import http.client
 import ipaddress
 import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 # OUI prefixes (first 3 bytes of MAC) commonly used by phones / tablets.
@@ -281,9 +284,9 @@ def browse_mdns(timeout=8):
         txt = parts[9] if len(parts) > 9 else ""
 
         txt_name = ""
-        match = re.search(r'(?:^|[ "])(?:name|nm)=([^"\s]+)', txt)
+        match = re.search(r'(?:^|[ "])(?:name|nm|fn)=([^",]+)', txt)
         if match:
-            txt_name = match.group(1)
+            txt_name = match.group(1).strip()
 
         names = []
         for cand in (clean_name(service_name), txt_name, hostname):
@@ -307,23 +310,174 @@ def browse_mdns(timeout=8):
     return candidates
 
 
+def ptr_name(ip):
+    """Reverse-DNS (PTR) lookup; many routers register DHCP hostnames here."""
+    try:
+        host, _aliases, _addrs = socket.gethostbyaddr(ip)
+    except (socket.herror, socket.gaierror, OSError):
+        return ""
+    return host.strip(".")
+
+
+def netbios_name(ip, timeout=1.5):
+    """NetBIOS name query via nmblookup (Windows / Samba / some Android)."""
+    if not shutil.which("nmblookup"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["nmblookup", "-A", ip],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "<00>" and "<GROUP>" not in line.upper():
+            return fields[0]
+    return ""
+
+
+def http_title(ip, timeout=1.0):
+    """Last resort: grab the <title> of the device's web interface."""
+    for scheme, port in (("http", 80), ("http", 8008), ("https", 443)):
+        context = None
+        if scheme == "https":
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        try:
+            with urllib.request.urlopen(
+                f"{scheme}://{ip}:{port}/", timeout=timeout, context=context
+            ) as response:
+                blob = response.read(1 << 16)
+        except (OSError, ValueError, http.client.HTTPException):
+            continue
+        match = re.search(rb"<title[^>]*>(.*?)</title>", blob, re.I | re.S)
+        if match:
+            title = re.sub(rb"\s+", b" ", match.group(1)).strip()
+            title = title.decode("utf-8", "replace")
+            if title and not re.fullmatch(r"\d{3}[a-z ]*", title, re.I):
+                return title
+    return ""
+
+
+def fallback_name(ip):
+    return netbios_name(ip) or ptr_name(ip) or http_title(ip)
+
+
+def locally_administered(mac):
+    """True when the MAC's local bit is set (privacy/randomized MACs)."""
+    try:
+        return bool(int(mac[:2], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+SSDP_ADDR = ("239.255.255.250", 1900)
+
+
+def ssdp_locations(timeout=2.0):
+    """Send an SSDP M-SEARCH and return {ipv4: description_url}."""
+    request = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 1\r\n"
+        "ST: ssdp:all\r\n"
+        "USER-AGENT: scan_phone/1.0\r\n"
+        "\r\n"
+    ).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.4)
+    locations = {}
+    try:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        except OSError:
+            pass
+        try:
+            for _ in range(2):
+                sock.sendto(request, SSDP_ADDR)
+        except OSError:
+            return {}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            match = re.search(rb"(?im)^location:[ \t]*(\S+)", data)
+            if match and addr[0] not in locations:
+                locations[addr[0]] = match.group(1).decode("utf-8", "replace")
+    finally:
+        sock.close()
+    return locations
+
+
+def friendly_name(location):
+    """Fetch a UPnP device description and extract its friendlyName."""
+    try:
+        with urllib.request.urlopen(location, timeout=1.0) as response:
+            blob = response.read(1 << 16)
+    except (OSError, ValueError, http.client.HTTPException):
+        return ""
+    match = re.search(rb"<friendlyName>(.*?)</friendlyName>", blob, re.I | re.S)
+    if not match:
+        return ""
+    return match.group(1).decode("utf-8", "replace").strip()
+
+
+def browse_ssdp(timeout=2.0):
+    """Return {ipv4: friendly_name} for UPnP/SSDP devices answering on the LAN."""
+    locations = ssdp_locations(timeout)
+    if not locations:
+        return {}
+    names = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ip, name in zip(locations, pool.map(friendly_name, locations.values())):
+            if name:
+                names[ip] = name
+    return names
+
+
 def scan_once(network, workers):
     """Run one sweep and return a list of host rows."""
     sweep(network, workers)
     arp = read_arp_table()
-    mdns = browse_mdns()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        mdns_future = pool.submit(browse_mdns)
+        ssdp_future = pool.submit(browse_ssdp)
+        mdns = mdns_future.result()
+        ssdp = ssdp_future.result()
 
     ips = {ip for ip in arp if ipaddress.ip_address(ip) in network}
     ips |= {ip for ip in mdns if ipaddress.ip_address(ip) in network}
+    ips |= {ip for ip in ssdp if ipaddress.ip_address(ip) in network}
+
+    need = [
+        ip for ip in ips if not (mdns.get(ip, {}).get("name") or ssdp.get(ip, ""))
+    ]
+    extra = {}
+    if need:
+        with ThreadPoolExecutor(max_workers=min(32, len(need))) as pool:
+            extra = dict(zip(need, pool.map(fallback_name, need)))
 
     rows = []
     for ip in sorted(ips, key=ipaddress.ip_address):
         mac = arp.get(ip, "")
         vendor = vendor_for(mac) if mac else None
         info = mdns.get(ip, {})
-        name = info.get("name", "")
-        is_phone = bool(vendor) or info.get("phone", False)
-        label = vendor or ("phone" if is_phone else "unknown")
+        name = info.get("name") or ssdp.get(ip) or extra.get(ip, "")
+        randomized = bool(mac) and not vendor and locally_administered(mac)
+        is_phone = bool(vendor) or info.get("phone", False) or randomized
+        label = vendor or (
+            "randomized" if randomized else ("phone" if is_phone else "unknown")
+        )
         rows.append((ip, name, mac, label, is_phone))
     return rows
 
